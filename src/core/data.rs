@@ -4,41 +4,116 @@ use std::fmt;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-/// Encapsulates a single column of data with high-performance null handling.
-///
-/// Charton uses a columnar memory layout similar to Apache Arrow. Numerical
-/// types are stored in contiguous vectors for GPU-friendly access, while
-/// null values are tracked via bitmasks (validity maps) or IEEE 754 NaN values.
+/// Represents the precision of temporal data, matching Polars' TimeUnit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeUnit {
+    Milliseconds,
+    Microseconds,
+    Nanoseconds,
+}
+
+/// Encapsulates a single column of data with high-performance memory layout.
+/// 
+/// Naming and structure are designed to be "Polars-friendly", allowing near 
+/// zero-cost conversion from Polars DataFrames while maintaining a 
+/// visualization-optimized architecture.
 #[derive(Clone, Debug)]
 pub enum ColumnVector {
-    /// 64-bit floats. Nulls are represented by `f64::NAN` for zero-overhead hardware support.
-    F64 { data: Vec<f64> },
-    /// 32-bit floats. Nulls are represented by `f32::NAN`.
-    F32 { data: Vec<f32> },
-    /// 64-bit integers. Since integers lack a NaN state, nulls are tracked via `validity`.
-    I64 {
-        data: Vec<i64>,
-        /// Bitmask where 1 = Valid, 0 = Null. If None, all rows are valid.
+    /// Boolean values (true/false). Nulls are tracked via validity bitmask.
+    Boolean {
+        data: Vec<bool>,
         validity: Option<Vec<u8>>,
     },
-    /// 32-bit integers. Since integers lack a NaN state, nulls are tracked via `validity`.
-    I32 {
+
+    // --- Integer Types ---
+    // Retained for memory efficiency in Wasm and zero-copy Polars compatibility.
+
+    /// 8-bit signed integers.
+    Int8 {
+        data: Vec<i8>,
+        validity: Option<Vec<u8>>,
+    },
+    /// 16-bit signed integers.
+    Int16 {
+        data: Vec<i16>,
+        validity: Option<Vec<u8>>,
+    },
+    /// 32-bit signed integers.
+    Int32 {
         data: Vec<i32>,
         validity: Option<Vec<u8>>,
     },
-    /// 32-bit unsigned integers. Commonly used for counts or discrete indices.
-    U32 {
+    /// 64-bit signed integers.
+    Int64 {
+        data: Vec<i64>,
+        validity: Option<Vec<u8>>,
+    },
+    /// 32-bit unsigned integers. Often used for indexing or Categorical keys.
+    UInt32 {
         data: Vec<u32>,
         validity: Option<Vec<u8>>,
     },
-    /// String data. Nulls are stored as empty strings and tracked via `validity`.
+    /// 64-bit unsigned integers. Often used for large IDs or hashes.
+    UInt64 {
+        data: Vec<u64>,
+        validity: Option<Vec<u8>>,
+    },
+
+    // --- Floating Point Types ---
+    
+    /// 32-bit floating point numbers.
+    Float32 {
+        data: Vec<f32>,
+        validity: Option<Vec<u8>>,
+    },
+    /// 64-bit floating point numbers. The primary type for coordinate calculations.
+    Float64 {
+        data: Vec<f64>,
+        validity: Option<Vec<u8>>,
+    },
+
+    // --- String & Categorical Types ---
+
+    /// UTF-8 String data. Best for low-cardinality metadata (e.g., tooltips).
     String {
         data: Vec<String>,
         validity: Option<Vec<u8>>,
     },
-    /// Temporal data. Nulls are tracked via `validity`.
-    DateTime {
-        data: Vec<OffsetDateTime>,
+    /// Categorical data using an index-to-dictionary mapping.
+    /// Perfectly maps to Polars' `Categorical` or `Enum` types.
+    /// Significant memory savings for repetitive labels in charts.
+    Categorical {
+        /// Physical indices pointing into the values vector.
+        keys: Vec<u32>,
+        /// The dictionary of unique string labels.
+        values: Vec<String>,
+        validity: Option<Vec<u8>>,
+    },
+
+    // --- Temporal Types ---
+    // Stored as physical primitives (i32/i64) to ensure SIMD-friendly scaling.
+
+    /// Date stored as days since UNIX epoch (1970-01-01).
+    Date {
+        data: Vec<i32>,
+        validity: Option<Vec<u8>>,
+    },
+    /// Datetime stored as an integer since UNIX epoch in the given TimeUnit.
+    /// Matches Polars' Datetime logical type.
+    Datetime {
+        data: Vec<i64>,
+        validity: Option<Vec<u8>>,
+        unit: TimeUnit,
+    },
+    /// Duration representing a time span (e.g., for Gantt charts or processing time).
+    Duration {
+        data: Vec<i64>,
+        validity: Option<Vec<u8>>,
+        unit: TimeUnit,
+    },
+    /// Time of day, stored as nanoseconds since midnight.
+    Time {
+        data: Vec<i64>,
         validity: Option<Vec<u8>>,
     },
 }
@@ -64,43 +139,95 @@ impl ColumnVector {
     /// Infers the [SemanticType] of the column based on its internal storage variant.
     ///
     /// This is a low-latency operation used to guide the selection of
-    /// visual encoding strategies (e.g., choosing a TimeScale for DateTime).
+    /// visual encoding strategies (e.g., choosing a TimeScale for Datetime).
     pub fn semantic_type(&self) -> SemanticType {
         match self {
-            ColumnVector::F64 { .. }
-            | ColumnVector::F32 { .. }
-            | ColumnVector::I64 { .. }
-            | ColumnVector::I32 { .. }
-            | ColumnVector::U32 { .. } => SemanticType::Continuous,
-            ColumnVector::String { .. } => SemanticType::Discrete,
-            ColumnVector::DateTime { .. } => SemanticType::Temporal,
+            // --- Continuous: Measurable numeric values ---
+            ColumnVector::Float64 { .. }
+            | ColumnVector::Float32 { .. }
+            | ColumnVector::Int64 { .. }
+            | ColumnVector::Int32 { .. }
+            | ColumnVector::Int16 { .. }
+            | ColumnVector::Int8 { .. }
+            | ColumnVector::UInt64 { .. }
+            | ColumnVector::UInt32 { .. }
+            // Duration is physically an i64, but logically a measurable span 
+            | ColumnVector::Duration { .. } => SemanticType::Continuous,
+
+            // --- Discrete: Qualitative categories ---
+            ColumnVector::String { .. }
+            | ColumnVector::Categorical { .. }
+            | ColumnVector::Boolean { .. } => SemanticType::Discrete,
+
+            // --- Temporal: Points in time ---
+            ColumnVector::Date { .. }
+            | ColumnVector::Datetime { .. }
+            | ColumnVector::Time { .. } => SemanticType::Temporal,
         }
     }
 
     /// Returns a short string representation of the data type,
     /// consistent with Polars' naming conventions (e.g., "f64", "str", "datetime").
+    ///
+    /// This is used primarily for diagnostic printing and debugging, 
+    /// allowing users to quickly identify the physical storage of a column.
     pub fn dtype_name(&self) -> &'static str {
         match self {
-            ColumnVector::F64 { .. } => "f64",
-            ColumnVector::F32 { .. } => "f32",
-            ColumnVector::I64 { .. } => "i64",
-            ColumnVector::I32 { .. } => "i32",
-            ColumnVector::U32 { .. } => "u32",
-            ColumnVector::String { .. } => "str", // Polars uses "str" for String
-            ColumnVector::DateTime { .. } => "datetime", // Short and clear
+            // --- Floats ---
+            ColumnVector::Float64 { .. } => "f64",
+            ColumnVector::Float32 { .. } => "f32",
+
+            // --- Signed Integers ---
+            ColumnVector::Int64 { .. } => "i64",
+            ColumnVector::Int32 { .. } => "i32",
+            ColumnVector::Int16 { .. } => "i16",
+            ColumnVector::Int8 { .. }  => "i8",
+
+            // --- Unsigned Integers ---
+            ColumnVector::UInt64 { .. } => "u64",
+            ColumnVector::UInt32 { .. } => "u32",
+
+            // --- Booleans ---
+            ColumnVector::Boolean { .. } => "bool",
+
+            // --- Strings & Categorical ---
+            ColumnVector::String { .. }      => "str", // Polars uses "str" for String/Utf8
+            ColumnVector::Categorical { .. } => "cat", // Consistent with Polars' Categorical shorthand
+
+            // --- Temporal ---
+            ColumnVector::Date { .. }     => "date",
+            ColumnVector::Datetime { .. } => "datetime",
+            ColumnVector::Duration { .. } => "duration",
+            ColumnVector::Time { .. }     => "time",
         }
     }
 
     /// Returns the number of rows in this column.
     pub fn len(&self) -> usize {
         match self {
-            ColumnVector::F64 { data } => data.len(),
-            ColumnVector::F32 { data } => data.len(),
-            ColumnVector::I64 { data, .. } => data.len(),
-            ColumnVector::I32 { data, .. } => data.len(),
-            ColumnVector::U32 { data, .. } => data.len(),
+            // Standard numeric and boolean types
+            ColumnVector::Boolean { data, .. } => data.len(),
+            ColumnVector::Int8 { data, .. } => data.len(),
+            ColumnVector::Int16 { data, .. } => data.len(),
+            ColumnVector::Int32 { data, .. } => data.len(),
+            ColumnVector::Int64 { data, .. } => data.len(),
+            ColumnVector::UInt32 { data, .. } => data.len(),
+            ColumnVector::UInt64 { data, .. } => data.len(),
+            ColumnVector::Float32 { data, .. } => data.len(),
+            ColumnVector::Float64 { data, .. } => data.len(),
+
+            // Strings
             ColumnVector::String { data, .. } => data.len(),
-            ColumnVector::DateTime { data, .. } => data.len(),
+
+            // Categorical: The length is determined by the number of keys (indices), 
+            // not the number of unique values in the dictionary.
+            ColumnVector::Categorical { keys, .. } => keys.len(),
+
+            // Temporal types
+            ColumnVector::Date { data, .. } => data.len(),
+            ColumnVector::Datetime { data, .. } => data.len(),
+            ColumnVector::Duration { data, .. } => data.len(),
+            ColumnVector::Time { data, .. } => data.len(),
         }
     }
 
@@ -135,54 +262,81 @@ impl ColumnVector {
     }
 
     /// Safely retrieves a value as f64 for numerical calculations.
-    ///
-    /// This handles:
-    /// 1. Type casting from I64, I32, U32, F32 to F64.
-    /// 2. Null-checking via the validity bitmask.
-    /// 3. NaN-checking for float types.
+    /// 
+    /// This method handles:
+    /// 1. Type casting from all numeric, temporal, and boolean variants to f64.
+    /// 2. Null-checking by inspecting the validity bitmask for each variant.
+    /// 3. NaN-checking for floating-point types.
     pub fn get_f64(&self, row: usize) -> Option<f64> {
         match self {
-            // Floating point types check for NaN internally
-            ColumnVector::F64 { data } => {
-                let v = data[row];
-                if v.is_nan() { None } else { Some(v) }
+            // --- Floating Point Types ---
+            // We check the bitmask first, then ensure the value is not NaN.
+            ColumnVector::Float64 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) {
+                    let v = data[row];
+                    if v.is_nan() { None } else { Some(v) }
+                } else {
+                    None
+                }
             }
-            ColumnVector::F32 { data } => {
-                let v = data[row];
-                if v.is_nan() { None } else { Some(v as f64) }
+            ColumnVector::Float32 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) {
+                    let v = data[row];
+                    if v.is_nan() { None } else { Some(v as f64) }
+                } else {
+                    None
+                }
             }
 
-            // Integer types check the validity bitmask
-            ColumnVector::I64 { data, validity } => {
-                if ColumnVector::is_valid_in_mask(validity, row) {
-                    Some(data[row] as f64)
+            // --- Integer Types ---
+            // All integers are cast to f64 after passing the validity check.
+            ColumnVector::Int8 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
+            }
+            ColumnVector::Int16 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
+            }
+            ColumnVector::Int32 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
+            }
+            ColumnVector::Int64 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
+            }
+            ColumnVector::UInt32 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
+            }
+            ColumnVector::UInt64 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
+            }
+
+            // --- Boolean Type ---
+            // Maps true to 1.0 and false to 0.0.
+            ColumnVector::Boolean { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) {
+                    Some(if data[row] { 1.0 } else { 0.0 })
                 } else {
                     None
                 }
             }
-            // Integer types check the validity bitmask
-            ColumnVector::I32 { data, validity } => {
-                if ColumnVector::is_valid_in_mask(validity, row) {
-                    Some(data[row] as f64)
-                } else {
-                    None
-                }
+
+            // --- Temporal Types ---
+            // Uses the underlying physical integer value (timestamp or days) for calculations.
+            ColumnVector::Date { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
             }
-            ColumnVector::U32 { data, validity } => {
-                if ColumnVector::is_valid_in_mask(validity, row) {
-                    Some(data[row] as f64)
-                } else {
-                    None
-                }
+            ColumnVector::Datetime { data, validity, .. } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
             }
-            ColumnVector::DateTime { data, validity } => {
-                if ColumnVector::is_valid_in_mask(validity, row) {
-                    Some(data[row].unix_timestamp_nanos() as f64) // Unix timestamp in nanoseconds
-                } else {
-                    None
-                }
+            ColumnVector::Duration { data, validity, .. } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
             }
-            ColumnVector::String { .. } => None,
+            ColumnVector::Time { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(data[row] as f64) } else { None }
+            }
+
+            // --- Categorical & String ---
+            // These types do not have a direct continuous numerical representation.
+            ColumnVector::String { .. } | ColumnVector::Categorical { .. } => None,
         }
     }
 
@@ -206,34 +360,20 @@ impl ColumnVector {
     /// This is a high-cost operation ($O(n)$ time + memory allocation),
     /// hence the `to_` prefix to signal ownership transfer and allocation.
     ///
-    /// The logic is internally consistent with `get_f64`, ensuring that
-    /// type casting and validity bitmask checks remain synchronized.
+    /// This method is internally consistent with `get_f64`, ensuring that
+    /// type casting, validity bitmask checks, and NaN handling remain synchronized.
     pub fn to_f64_vec(&self) -> Vec<f64> {
         let n = self.len();
         let mut out = Vec::with_capacity(n);
 
-        match self {
-            // Optimized Path: If underlying data is already F64,
-            // we bypass per-row enum dispatching and handle NaNs directly.
-            ColumnVector::F64 { data } => {
-                out.extend(data.iter().map(|&v| if v.is_nan() { 0.0 } else { v }));
-            }
-            // Optimized Path: Bulk conversion from F32 to F64.
-            ColumnVector::F32 { data } => {
-                out.extend(
-                    data.iter()
-                        .map(|&v| if v.is_nan() { 0.0 } else { v as f64 }),
-                );
-            }
-            // Generic Path: Handles I64, I32, U32, and other numeric types
-            // by utilizing the validity bitmask-aware logic in `get_f64`.
-            _ => {
-                for i in 0..n {
-                    // Fallback to unified logic; maintains single-point-of-truth for null handling.
-                    out.push(self.get_f64(i).unwrap_or(0.0));
-                }
-            }
+        // Since all variants now support a validity bitmask and are handled by get_f64,
+        // we use a unified path to ensure consistent null/NaN handling across all types.
+        for i in 0..n {
+            // We use 0.0 as the fallback for gaps to ensure the resulting vector 
+            // is safe for hardware buffers (e.g., WebGPU or Canvas).
+            out.push(self.get_f64(i).unwrap_or(0.0));
         }
+
         out
     }
 
@@ -245,9 +385,11 @@ impl ColumnVector {
     }
 
     /// Retrieves a value as a String for grouping or labeling.
-    /// This is used as the 'Key' in group-by operations (like stacking).
+    /// This is used as the 'Key' in group-by operations (like stacking)
+    /// and for generating tooltips or categorical axis labels.
     pub fn get_str(&self, row: usize) -> Option<String> {
         match self {
+            // --- String: Direct retrieval ---
             ColumnVector::String { data, validity } => {
                 if Self::is_valid_in_mask(validity, row) {
                     Some(data[row].clone())
@@ -255,49 +397,73 @@ impl ColumnVector {
                     None
                 }
             }
-            ColumnVector::I64 { data, validity } => {
+
+            // --- Categorical: Map index to dictionary value ---
+            ColumnVector::Categorical { keys, values, validity } => {
                 if Self::is_valid_in_mask(validity, row) {
+                    let key = keys[row] as usize;
+                    values.get(key).cloned()
+                } else {
+                    None
+                }
+            }
+
+            // --- Boolean: Simple labels ---
+            ColumnVector::Boolean { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) {
+                    Some(if data[row] { "true".to_string() } else { "false".to_string() })
+                } else {
+                    None
+                }
+            }
+
+            // --- Floating Point Types ---
+            ColumnVector::Float64 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) && !data[row].is_nan() {
                     Some(format!("{}", data[row]))
                 } else {
                     None
                 }
             }
-            ColumnVector::I32 { data, validity } => {
-                if Self::is_valid_in_mask(validity, row) {
+            ColumnVector::Float32 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) && !data[row].is_nan() {
                     Some(format!("{}", data[row]))
                 } else {
                     None
                 }
             }
-            ColumnVector::U32 { data, validity } => {
-                if Self::is_valid_in_mask(validity, row) {
-                    Some(format!("{}", data[row]))
-                } else {
-                    None
-                }
+
+            // --- Integer & Temporal Types: Generic string conversion ---
+            // All of these types implement Display via format!
+            ColumnVector::Int8 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
             }
-            ColumnVector::F64 { data } => {
-                let v = data[row];
-                if v.is_nan() {
-                    None
-                } else {
-                    Some(format!("{}", v))
-                }
+            ColumnVector::Int16 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
             }
-            ColumnVector::F32 { data } => {
-                let v = data[row];
-                if v.is_nan() {
-                    None
-                } else {
-                    Some(format!("{}", v))
-                }
+            ColumnVector::Int32 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
             }
-            ColumnVector::DateTime { data, validity } => {
-                if Self::is_valid_in_mask(validity, row) {
-                    Some(format!("{}", data[row]))
-                } else {
-                    None
-                }
+            ColumnVector::Int64 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
+            }
+            ColumnVector::UInt32 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
+            }
+            ColumnVector::UInt64 { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
+            }
+            ColumnVector::Date { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
+            }
+            ColumnVector::Datetime { data, validity, .. } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
+            }
+            ColumnVector::Duration { data, validity, .. } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
+            }
+            ColumnVector::Time { data, validity } => {
+                if Self::is_valid_in_mask(validity, row) { Some(format!("{}", data[row])) } else { None }
             }
         }
     }
@@ -319,58 +485,83 @@ impl ColumnVector {
 
     /// Creates a new ColumnVector containing only the specified rows.
     ///
-    /// This preserves the original variant type and re-indexes the validity
+    /// This is a fundamental operation for filtering, sorting, and shuffling.
+    /// It preserves the original variant type and re-indexes the validity 
     /// bitmask to ensure null-state consistency after row reordering.
     pub fn take(&self, indices: &[usize]) -> Self {
         match self {
-            ColumnVector::F64 { data } => {
-                let new_data = indices.iter().map(|&i| data[i]).collect();
-                ColumnVector::F64 { data: new_data }
-            }
-            ColumnVector::F32 { data } => {
-                let new_data = indices.iter().map(|&i| data[i]).collect();
-                ColumnVector::F32 { data: new_data }
-            }
-            ColumnVector::I64 { data, validity } => {
-                let new_data = indices.iter().map(|&i| data[i]).collect();
-                let new_validity = self.take_validity(validity, indices);
-                ColumnVector::I64 {
-                    data: new_data,
-                    validity: new_validity,
-                }
-            }
-            ColumnVector::I32 { data, validity } => {
-                let new_data = indices.iter().map(|&i| data[i]).collect();
-                let new_validity = self.take_validity(validity, indices);
-                ColumnVector::I32 {
-                    data: new_data,
-                    validity: new_validity,
-                }
-            }
-            ColumnVector::U32 { data, validity } => {
-                let new_data = indices.iter().map(|&i| data[i]).collect();
-                let new_validity = self.take_validity(validity, indices);
-                ColumnVector::U32 {
-                    data: new_data,
-                    validity: new_validity,
-                }
-            }
-            ColumnVector::String { data, validity } => {
-                let new_data = indices.iter().map(|&i| data[i].clone()).collect();
-                let new_validity = self.take_validity(validity, indices);
-                ColumnVector::String {
-                    data: new_data,
-                    validity: new_validity,
-                }
-            }
-            ColumnVector::DateTime { data, validity } => {
-                let new_data = indices.iter().map(|&i| data[i]).collect();
-                let new_validity = self.take_validity(validity, indices);
-                ColumnVector::DateTime {
-                    data: new_data,
-                    validity: new_validity,
-                }
-            }
+            // --- Floating Point ---
+            ColumnVector::Float64 { data, validity } => ColumnVector::Float64 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::Float32 { data, validity } => ColumnVector::Float32 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+
+            // --- Integers ---
+            ColumnVector::Int64 { data, validity } => ColumnVector::Int64 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::Int32 { data, validity } => ColumnVector::Int32 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::Int16 { data, validity } => ColumnVector::Int16 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::Int8 { data, validity } => ColumnVector::Int8 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::UInt64 { data, validity } => ColumnVector::UInt64 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::UInt32 { data, validity } => ColumnVector::UInt32 {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+
+            // --- Boolean ---
+            ColumnVector::Boolean { data, validity } => ColumnVector::Boolean {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+
+            // --- Strings & Categorical ---
+            ColumnVector::String { data, validity } => ColumnVector::String {
+                data: indices.iter().map(|&i| data[i].clone()).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::Categorical { keys, values, validity } => ColumnVector::Categorical {
+                keys: indices.iter().map(|&i| keys[i]).collect(),
+                values: values.clone(), // Dictionary is preserved as-is
+                validity: self.take_validity(validity, indices),
+            },
+
+            // --- Temporal ---
+            ColumnVector::Date { data, validity } => ColumnVector::Date {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
+            ColumnVector::Datetime { data, validity, unit } => ColumnVector::Datetime {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+                unit: *unit,
+            },
+            ColumnVector::Duration { data, validity, unit } => ColumnVector::Duration {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+                unit: *unit,
+            },
+            ColumnVector::Time { data, validity } => ColumnVector::Time {
+                data: indices.iter().map(|&i| data[i]).collect(),
+                validity: self.take_validity(validity, indices),
+            },
         }
     }
 
@@ -403,20 +594,55 @@ impl ColumnVector {
     /// This implementation respects the specific null-representation of each
     /// variant (NaN for floats, bitmasks for others) to ensure accurate statistics.
     pub fn n_unique(&self) -> usize {
+        // --- FAST PATH: Categorical ---
+        // For categorical data, the dictionary (values) already represents 
+        // the unique set of non-null entries.
+        if let ColumnVector::Categorical { values, .. } = self {
+            return values.len();
+        }
+
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
 
+            // Helper macro to avoid repeating the same parallel fold/reduce logic 
+            // for primitive types (Integers, Temporals, Booleans).
+            macro_rules! parallel_unique_impl {
+                ($data:expr, $validity:expr) => {
+                    (0..$data.len())
+                        .into_par_iter()
+                        .fold(AHashSet::new, |mut set, i| {
+                            if Self::is_valid_in_mask($validity, i) {
+                                set.insert($data[i].clone());
+                            }
+                            set
+                        })
+                        .reduce(AHashSet::new, |mut s1, s2| {
+                            s1.extend(s2);
+                            s1
+                        })
+                        .len()
+                };
+            }
+
             match self {
+                // Categorical handled in fast path above
+                ColumnVector::Categorical { .. } => unreachable!(),
+
                 // --- FLOAT PATHS (F64/F32) ---
-                // Normalizes -0.0 and 0.0 to the same bit representation and filters NaNs.
-                ColumnVector::F64 { data } => {
-                    data.par_iter()
-                        .filter(|&&v| !v.is_nan())
-                        .fold(AHashSet::new, |mut set, &v| {
-                            // In IEEE 754, -0.0 == 0.0 is true
-                            let norm = if v == 0.0 { 0.0 } else { v };
-                            set.insert(norm.to_bits());
+                // We must check BOTH the validity bitmask AND NaN status.
+                // We also normalize -0.0 and 0.0 to ensure they aren't counted twice.
+                ColumnVector::F64 { data, validity } => {
+                    (0..data.len())
+                        .into_par_iter()
+                        .fold(AHashSet::new, |mut set, i| {
+                            if Self::is_valid_in_mask(validity, i) {
+                                let v = data[i];
+                                if !v.is_nan() {
+                                    let norm = if v == 0.0 { 0.0 } else { v };
+                                    set.insert(norm.to_bits());
+                                }
+                            }
                             set
                         })
                         .reduce(AHashSet::new, |mut s1, s2| {
@@ -426,94 +652,42 @@ impl ColumnVector {
                         .len()
                 }
 
-                ColumnVector::F32 { data } => data
-                    .par_iter()
-                    .filter(|&&v| !v.is_nan())
-                    .fold(AHashSet::new, |mut set, &v| {
-                        let norm = if v == 0.0 { 0.0 } else { v };
-                        set.insert(norm.to_bits());
-                        set
-                    })
-                    .reduce(AHashSet::new, |mut s1, s2| {
-                        s1.extend(s2);
-                        s1
-                    })
-                    .len(),
+                ColumnVector::F32 { data, validity } => {
+                    (0..data.len())
+                        .into_par_iter()
+                        .fold(AHashSet::new, |mut set, i| {
+                            if Self::is_valid_in_mask(validity, i) {
+                                let v = data[i];
+                                if !v.is_nan() {
+                                    let norm = if v == 0.0 { 0.0 } else { v };
+                                    set.insert(norm.to_bits());
+                                }
+                            }
+                            set
+                        })
+                        .reduce(AHashSet::new, |mut s1, s2| {
+                            s1.extend(s2);
+                            s1
+                        })
+                        .len()
+                }
 
                 // --- STRING PATH ---
-                // Uses the validity bitmask to skip null strings during parallel iteration.
-                ColumnVector::String { data, validity } => (0..data.len())
-                    .into_par_iter()
-                    .fold(AHashSet::new, |mut set, i| {
-                        if Self::is_valid_in_mask(validity, i) {
-                            set.insert(&data[i]);
-                        }
-                        set
-                    })
-                    .reduce(AHashSet::new, |mut s1, s2| {
-                        s1.extend(s2);
-                        s1
-                    })
-                    .len(),
+                ColumnVector::String { data, validity } => parallel_unique_impl!(data, validity),
 
-                // --- INTEGER PATHS (I64, I32, U32) ---
-                // Efficiently processes primitive integers using thread-local sets.
-                ColumnVector::I64 { data, validity } => (0..data.len())
-                    .into_par_iter()
-                    .fold(AHashSet::new, |mut set, i| {
-                        if Self::is_valid_in_mask(validity, i) {
-                            set.insert(data[i]);
-                        }
-                        set
-                    })
-                    .reduce(AHashSet::new, |mut s1, s2| {
-                        s1.extend(s2);
-                        s1
-                    })
-                    .len(),
+                // --- INTEGER PATHS ---
+                ColumnVector::I64 { data, validity } => parallel_unique_impl!(data, validity),
+                ColumnVector::I32 { data, validity } => parallel_unique_impl!(data, validity),
+                ColumnVector::U32 { data, validity } => parallel_unique_impl!(data, validity),
 
-                ColumnVector::I32 { data, validity } => (0..data.len())
-                    .into_par_iter()
-                    .fold(AHashSet::new, |mut set, i| {
-                        if Self::is_valid_in_mask(validity, i) {
-                            set.insert(data[i]);
-                        }
-                        set
-                    })
-                    .reduce(AHashSet::new, |mut s1, s2| {
-                        s1.extend(s2);
-                        s1
-                    })
-                    .len(),
-
-                ColumnVector::U32 { data, validity } => (0..data.len())
-                    .into_par_iter()
-                    .fold(AHashSet::new, |mut set, i| {
-                        if Self::is_valid_in_mask(validity, i) {
-                            set.insert(data[i]);
-                        }
-                        set
-                    })
-                    .reduce(AHashSet::new, |mut s1, s2| {
-                        s1.extend(s2);
-                        s1
-                    })
-                    .len(),
-
-                // --- TEMPORAL PATH ---
-                ColumnVector::DateTime { data, validity } => (0..data.len())
-                    .into_par_iter()
-                    .fold(AHashSet::new, |mut set, i| {
-                        if Self::is_valid_in_mask(validity, i) {
-                            set.insert(data[i]);
-                        }
-                        set
-                    })
-                    .reduce(AHashSet::new, |mut s1, s2| {
-                        s1.extend(s2);
-                        s1
-                    })
-                    .len(),
+                // --- TEMPORAL PATHS ---
+                ColumnVector::DateTime { data, validity } => parallel_unique_impl!(data, validity),
+                ColumnVector::Date { data, validity } => parallel_unique_impl!(data, validity),
+                ColumnVector::Time { data, validity } => parallel_unique_impl!(data, validity),
+                ColumnVector::Duration { data, validity } => parallel_unique_impl!(data, validity),
+                
+                // --- BOOLEAN PATH ---
+                ColumnVector::Boolean { data, validity } => parallel_unique_impl!(data, validity),
             }
         }
 
@@ -524,20 +698,47 @@ impl ColumnVector {
     }
 
     /// Returns the number of unique non-null values in the column using a serial implementation.
-    ///
-    /// This is used as the fallback when parallel features are disabled or for smaller
-    /// datasets where threading overhead is not justified.
     #[cfg(not(feature = "parallel"))]
     fn n_unique_serial(&self) -> usize {
+        // --- FAST PATH: Categorical ---
+        // For categorical data, we trust the dictionary's length.
+        if let ColumnVector::Categorical { values, .. } = self {
+            return values.len();
+        }
+
+        // Helper macro for all primitive types to avoid manual boilerplate.
+        macro_rules! serial_unique_impl {
+            ($data:expr, $validity:expr) => {{
+                let mut seen = AHashSet::new();
+                for (i, v) in $data.iter().enumerate() {
+                    if Self::is_valid_in_mask($validity, i) {
+                        seen.insert(v);
+                    }
+                }
+                seen.len()
+            }};
+        }
+
         match self {
-            // --- FLOAT PATHS ---
-            // We store the underlying bits (u64/u32) to handle floating point uniqueness
-            // while respecting IEEE 754 equality (normalizing -0.0 to 0.0).
-            ColumnVector::F64 { data } => {
+            // Categorical handled above.
+            ColumnVector::Categorical { .. } => unreachable!(),
+
+            // --- FLOATING POINT TYPES ---
+            // Special handling for bitmask + NaN + Normalization (-0.0 == 0.0)
+            ColumnVector::Float64 { data, validity } => {
                 let mut seen = AHashSet::with_capacity(data.len() / 4);
-                for &v in data {
-                    if !v.is_nan() {
-                        // Normalize -0.0 and 0.0 to have the same bit pattern
+                for (i, &v) in data.iter().enumerate() {
+                    if Self::is_valid_in_mask(validity, i) && !v.is_nan() {
+                        let norm = if v == 0.0 { 0.0 } else { v };
+                        seen.insert(norm.to_bits());
+                    }
+                }
+                seen.len()
+            }
+            ColumnVector::Float32 { data, validity } => {
+                let mut seen = AHashSet::with_capacity(data.len() / 4);
+                for (i, &v) in data.iter().enumerate() {
+                    if Self::is_valid_in_mask(validity, i) && !v.is_nan() {
                         let norm = if v == 0.0 { 0.0 } else { v };
                         seen.insert(norm.to_bits());
                     }
@@ -545,220 +746,191 @@ impl ColumnVector {
                 seen.len()
             }
 
-            ColumnVector::F32 { data } => {
-                let mut seen = AHashSet::with_capacity(data.len() / 4);
-                for &v in data {
-                    if !v.is_nan() {
-                        let norm = if v == 0.0 { 0.0 } else { v };
-                        seen.insert(norm.to_bits());
-                    }
-                }
-                seen.len()
-            }
+            // --- STRING TYPE ---
+            ColumnVector::String { data, validity } => serial_unique_impl!(data, validity),
 
-            // --- INTEGER PATHS ---
-            // Directly store integers. We use the validity mask to skip nulls.
-            ColumnVector::I64 { data, validity } => {
-                let mut seen = AHashSet::new();
-                for (i, &v) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        seen.insert(v);
-                    }
-                }
-                seen.len()
-            }
+            // --- INTEGER TYPES ---
+            ColumnVector::Int8 { data, validity } => serial_unique_impl!(data, validity),
+            ColumnVector::Int16 { data, validity } => serial_unique_impl!(data, validity),
+            ColumnVector::Int32 { data, validity } => serial_unique_impl!(data, validity),
+            ColumnVector::Int64 { data, validity } => serial_unique_impl!(data, validity),
+            ColumnVector::UInt32 { data, validity } => serial_unique_impl!(data, validity),
+            ColumnVector::UInt64 { data, validity } => serial_unique_impl!(data, validity),
 
-            ColumnVector::I32 { data, validity } => {
-                let mut seen = AHashSet::new();
-                for (i, &v) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        seen.insert(v);
-                    }
-                }
-                seen.len()
-            }
+            // --- TEMPORAL TYPES ---
+            ColumnVector::Date { data, validity } => serial_unique_impl!(data, validity),
+            ColumnVector::Datetime { data, validity, .. } => serial_unique_impl!(data, validity),
+            ColumnVector::Duration { data, validity, .. } => serial_unique_impl!(data, validity),
+            ColumnVector::Time { data, validity } => serial_unique_impl!(data, validity),
 
-            ColumnVector::U32 { data, validity } => {
-                let mut seen = AHashSet::new();
-                for (i, &v) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        seen.insert(v);
-                    }
-                }
-                seen.len()
-            }
-
-            // --- STRING PATH ---
-            // Store references (&String) to avoid expensive cloning during the set insertion.
-            ColumnVector::String { data, validity } => {
-                let mut seen = AHashSet::new();
-                for (i, s) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        seen.insert(s);
-                    }
-                }
-                seen.len()
-            }
-
-            // --- TEMPORAL PATH ---
-            ColumnVector::DateTime { data, validity } => {
-                let mut seen = AHashSet::new();
-                for (i, &dt) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        seen.insert(dt);
-                    }
-                }
-                seen.len()
-            }
+            // --- BOOLEAN TYPE ---
+            ColumnVector::Boolean { data, validity } => serial_unique_impl!(data, validity),
         }
     }
 
     /// Returns a stable, unique list of values as Strings for Discrete scales.
     ///
-    /// This method treats the column data as categorical labels, regardless of
-    /// the underlying storage type (numeric, string, or temporal). It preserves
-    /// the "First Appearance" order to ensure stable visual mapping.
+    /// This method treats the column data as categorical labels, preserving 
+    /// the "First Appearance" order to ensure stable visual mapping in charts.
     pub fn unique_values(&self) -> Vec<String> {
+        // --- FAST PATH: Categorical ---
+        // For categorical data, the dictionary is already unique by design.
+        if let ColumnVector::Categorical { values, .. } = self {
+            return values.clone();
+        }
+
         let mut result = Vec::new();
-        let mut seen = AHashSet::new();
 
         match self {
-            // F64 uses NaN to represent nulls.
-            ColumnVector::F64 { data } => {
-                for &v in data {
-                    if !v.is_nan() {
-                        let s = v.to_string();
-                        if seen.insert(s.clone()) {
-                            result.push(s);
-                        }
-                    }
-                }
-            }
+            // Categorical handled in the fast path above.
+            ColumnVector::Categorical { .. } => unreachable!(),
 
-            // F32 uses NaN to represent nulls.
-            ColumnVector::F32 { data } => {
-                for &v in data {
-                    if !v.is_nan() {
-                        let s = v.to_string();
-                        if seen.insert(s.clone()) {
-                            result.push(s);
-                        }
-                    }
-                }
-            }
-
-            // I64 uses a bitmask (1 = Valid, 0 = Null).
-            ColumnVector::I64 { data, validity } => {
+            // --- FLOAT PATHS ---
+            // Floats are handled separately because they require bit-normalization 
+            // (-0.0 vs 0.0) and NaN filtering before being converted to Strings.
+            ColumnVector::Float64 { data, validity } => {
+                let mut seen = AHashSet::new();
                 for (i, &v) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        let s = v.to_string();
-                        if seen.insert(s.clone()) {
-                            result.push(s);
+                    if Self::is_valid_in_mask(validity, i) && !v.is_nan() {
+                        let norm = if v == 0.0 { 0.0 } else { v };
+                        if seen.insert(norm.to_bits()) {
+                            result.push(v.to_string());
                         }
                     }
                 }
             }
-
-            // I32 uses a bitmask.
-            ColumnVector::I32 { data, validity } => {
+            ColumnVector::Float32 { data, validity } => {
+                let mut seen = AHashSet::new();
                 for (i, &v) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        let s = v.to_string();
-                        if seen.insert(s.clone()) {
-                            result.push(s);
+                    if Self::is_valid_in_mask(validity, i) && !v.is_nan() {
+                        let norm = if v == 0.0 { 0.0 } else { v };
+                        if seen.insert(norm.to_bits()) {
+                            result.push(v.to_string());
                         }
                     }
                 }
             }
 
-            // U32 uses a bitmask.
-            ColumnVector::U32 { data, validity } => {
-                for (i, &v) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        let s = v.to_string();
-                        if seen.insert(s.clone()) {
-                            result.push(s);
-                        }
-                    }
-                }
-            }
-
-            // String uses a bitmask.
+            // --- STRING PATH ---
+            // Store references (&String) in the hashset to avoid redundant allocations.
             ColumnVector::String { data, validity } => {
+                let mut seen = AHashSet::new();
                 for (i, s) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) && seen.insert(s.clone()) {
+                    if Self::is_valid_in_mask(validity, i) && seen.insert(s) {
                         result.push(s.clone());
                     }
                 }
             }
 
-            // DateTime uses a bitmask.
-            // We convert OffsetDateTime to a stable string representation.
-            ColumnVector::DateTime { data, validity } => {
-                for (i, dt) in data.iter().enumerate() {
-                    if Self::is_valid_in_mask(validity, i) {
-                        let s = dt.to_string();
-                        if seen.insert(s.clone()) {
-                            result.push(s);
-                        }
-                    }
-                }
+            // --- PRIMITIVE & TEMPORAL PATHS ---
+            // Grouping all other types to use the i128-casting deduplication strategy.
+            _ => {
+                self.collect_unique_primitives_as_strings(&mut result);
             }
         }
         result
     }
 
+    /// Internal helper that uses i128 casting to deduplicate various integer and 
+    /// temporal types into a single stable String vector.
+    fn collect_unique_primitives_as_strings(&self, result: &mut Vec<String>) {
+        // Using i128 as a universal container to safely hold any Int/UInt/Temporal 
+        // value for hashing without type-mismatch or overflow issues.
+        let mut seen = AHashSet::<i128>::new();
+        
+        macro_rules! collect_cast {
+            ($data:expr, $validity:expr) => {
+                for (i, &v) in $data.iter().enumerate() {
+                    // Cast to i128 is a zero-cost register extension for smaller ints
+                    // and safely accommodates both signed and unsigned 64-bit values.
+                    if Self::is_valid_in_mask($validity, i) && seen.insert(v as i128) {
+                        result.push(v.to_string());
+                    }
+                }
+            };
+        }
+
+        match self {
+            ColumnVector::Int8 { data, validity } => collect_cast!(data, validity),
+            ColumnVector::Int16 { data, validity } => collect_cast!(data, validity),
+            ColumnVector::Int32 { data, validity } => collect_cast!(data, validity),
+            ColumnVector::Int64 { data, validity } => collect_cast!(data, validity),
+            ColumnVector::UInt32 { data, validity } => collect_cast!(data, validity),
+            ColumnVector::UInt64 { data, validity } => collect_cast!(data, validity),
+            
+            // Temporal types are stored as i32/i64 primitives.
+            ColumnVector::Date { data, validity } => collect_cast!(data, validity),
+            ColumnVector::Datetime { data, validity, .. } => collect_cast!(data, validity),
+            ColumnVector::Duration { data, validity, .. } => collect_cast!(data, validity),
+            ColumnVector::Time { data, validity } => collect_cast!(data, validity),
+
+            ColumnVector::Boolean { data, validity } => {
+                for (i, &v) in data.iter().enumerate() {
+                    if Self::is_valid_in_mask(validity, i) && seen.insert(if v { 1 } else { 0 }) {
+                        result.push(v.to_string());
+                    }
+                }
+            }
+            _ => {} // Fallback for types already handled or non-primitive.
+        }
+    }
+
     /// Computes both minimum and maximum values in a single parallel scan.
     ///
     /// Returns a tuple `(min, max)` as `f64`. This method handles null-checks
-    /// (NaN for floats and bitmasks for other types) and uses Rayon for
-    /// multi-threaded execution.
+    /// (NaN for floats and bitmasks for other types).
     pub fn min_max(&self) -> (f64, f64) {
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
 
-            let identity = (f64::INFINITY, f64::NEG_INFINITY);
             match self {
-                // --- FLOAT PATHS ---
-                ColumnVector::F64 { data } => data
-                    .par_iter()
-                    .filter(|&&v| !v.is_nan())
-                    .fold(|| identity, |(min, max), &v| (min.min(v), max.max(v)))
-                    .reduce(|| identity, |(m1, x1), (m2, x2)| (m1.min(m2), x1.max(x2))),
-                ColumnVector::F32 { data } => data
-                    .par_iter()
-                    .filter(|&&v| !v.is_nan())
-                    .fold(
-                        || identity,
-                        |(min, max), &v| {
-                            let v64 = v as f64;
-                            (min.min(v64), max.max(v64))
-                        },
-                    )
-                    .reduce(|| identity, |(m1, x1), (m2, x2)| (m1.min(m2), x1.max(x2))),
+                // --- FLOATING POINT PATHS ---
+                // We must check BOTH the validity mask and NaN status.
+                ColumnVector::Float64 { data, validity } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v)
+                }
+                ColumnVector::Float32 { data, validity } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
+                }
 
                 // --- INTEGER PATHS ---
-                // Explicitly cast primitives to f64 via the closure.
-                ColumnVector::I64 { data, validity } => {
+                ColumnVector::Int64 { data, validity } => {
                     self.parallel_scan_with_mask(data, validity, |&v| v as f64)
                 }
-                ColumnVector::I32 { data, validity } => {
+                ColumnVector::Int32 { data, validity } => {
                     self.parallel_scan_with_mask(data, validity, |&v| v as f64)
                 }
-                ColumnVector::U32 { data, validity } => {
+                ColumnVector::Int16 { data, validity } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
+                }
+                ColumnVector::Int8 { data, validity } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
+                }
+                ColumnVector::UInt64 { data, validity } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
+                }
+                ColumnVector::UInt32 { data, validity } => {
                     self.parallel_scan_with_mask(data, validity, |&v| v as f64)
                 }
 
-                // --- TEMPORAL PATH ---
-                // Converts OffsetDateTime to a Unix timestamp (nanoseconds) for numeric scaling.
-                ColumnVector::DateTime { data, validity } => {
-                    self.parallel_scan_with_mask(data, validity, |&v| {
-                        v.unix_timestamp_nanos() as f64
-                    })
+                // --- TEMPORAL PATHS ---
+                // Stored as i32/i64, directly cast to f64 for scaling calculations.
+                ColumnVector::Date { data, validity } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
+                }
+                ColumnVector::Datetime { data, validity, .. } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
+                }
+                ColumnVector::Duration { data, validity, .. } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
+                }
+                ColumnVector::Time { data, validity } => {
+                    self.parallel_scan_with_mask(data, validity, |&v| v as f64)
                 }
 
                 // --- DISCRETE/OTHER ---
+                // Categorical, String, and Boolean don't have a meaningful numeric min/max range.
                 _ => (0.0, 0.0),
             }
         }
@@ -770,9 +942,6 @@ impl ColumnVector {
     }
 
     /// Internal parallel scanner utilizing a Map-Reduce pattern for maximum throughput.
-    ///
-    /// Takes a data slice, an optional validity mask, and a conversion closure.
-    /// Fails gracefully by skipping masked (null) values.
     #[cfg(feature = "parallel")]
     fn parallel_scan_with_mask<T, F>(
         &self,
@@ -788,75 +957,74 @@ impl ColumnVector {
 
         let identity = (f64::INFINITY, f64::NEG_INFINITY);
 
-        if let Some(mask) = validity {
-            data.par_iter()
-                .enumerate()
-                .fold(
-                    || identity,
-                    |(min, max), (i, v)| {
-                        // Check the i-th bit in the bitmask
-                        if (mask[i / 8] >> (i % 8)) & 1 == 1 {
-                            let val = convert(v);
-                            (min.min(val), max.max(val))
-                        } else {
-                            (min, max)
-                        }
-                    },
-                )
-                .reduce(|| identity, |(m1, x1), (m2, x2)| (m1.min(m2), x1.max(x2)))
-        } else {
-            // Optimization: No bitmask present, process all elements.
-            data.par_iter()
-                .fold(
-                    || identity,
-                    |(min, max), v| {
+        data.par_iter()
+            .enumerate()
+            .fold(
+                || identity,
+                |(min, max), (i, v)| {
+                    // 1. Check validity mask (if present)
+                    if Self::is_valid_in_mask(validity, i) {
                         let val = convert(v);
-                        (min.min(val), max.max(val))
-                    },
-                )
-                .reduce(|| identity, |(m1, x1), (m2, x2)| (m1.min(m2), x1.max(x2)))
-        }
+                        // 2. Check for NaN (important for Float variants)
+                        if !val.is_nan() {
+                            return (min.min(val), max.max(val));
+                        }
+                    }
+                    (min, max)
+                },
+            )
+            .reduce(
+                || identity,
+                |(m1, x1), (m2, x2)| (m1.min(m2), x1.max(x2)),
+            )
     }
 
     /// Serial implementation of min_max to handle non-parallel builds.
-    /// This handles NaN filtering for floats and uses serial_scan_with_mask for integers/dates.
     #[cfg(not(feature = "parallel"))]
     fn min_max_serial(&self) -> (f64, f64) {
-        let identity = (f64::INFINITY, f64::NEG_INFINITY);
         match self {
-            ColumnVector::F64 { data } => {
-                let mut m = identity;
-                for &v in data {
-                    if !v.is_nan() {
-                        m.0 = m.0.min(v);
-                        m.1 = m.1.max(v);
-                    }
-                }
-                m
+            // --- FLOATING POINT PATHS ---
+            ColumnVector::Float64 { data, validity } => {
+                self.serial_scan_with_mask(data, validity, |&v| v)
             }
-            ColumnVector::F32 { data } => {
-                let mut m = identity;
-                for &v in data {
-                    if !v.is_nan() {
-                        let v64 = v as f64;
-                        m.0 = m.0.min(v64);
-                        m.1 = m.1.max(v64);
-                    }
-                }
-                m
-            }
-            ColumnVector::I64 { data, validity } => {
+            ColumnVector::Float32 { data, validity } => {
                 self.serial_scan_with_mask(data, validity, |&v| v as f64)
             }
-            ColumnVector::I32 { data, validity } => {
+
+            // --- INTEGER PATHS ---
+            ColumnVector::Int64 { data, validity } => {
                 self.serial_scan_with_mask(data, validity, |&v| v as f64)
             }
-            ColumnVector::U32 { data, validity } => {
+            ColumnVector::Int32 { data, validity } => {
                 self.serial_scan_with_mask(data, validity, |&v| v as f64)
             }
-            ColumnVector::DateTime { data, validity } => {
-                self.serial_scan_with_mask(data, validity, |&v| v.unix_timestamp_nanos() as f64)
+            ColumnVector::Int16 { data, validity } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
             }
+            ColumnVector::Int8 { data, validity } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
+            }
+            ColumnVector::UInt64 { data, validity } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
+            }
+            ColumnVector::UInt32 { data, validity } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
+            }
+
+            // --- TEMPORAL PATHS ---
+            ColumnVector::Date { data, validity } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
+            }
+            ColumnVector::Datetime { data, validity, .. } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
+            }
+            ColumnVector::Duration { data, validity, .. } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
+            }
+            ColumnVector::Time { data, validity } => {
+                self.serial_scan_with_mask(data, validity, |&v| v as f64)
+            }
+
             _ => (0.0, 0.0),
         }
     }
@@ -875,29 +1043,16 @@ impl ColumnVector {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
 
-        if let Some(mask) = validity {
-            for (i, v) in data.iter().enumerate() {
-                if (mask[i / 8] >> (i % 8)) & 1 == 1 {
-                    let val = convert(v);
-                    if val < min {
-                        min = val;
-                    }
-                    if val > max {
-                        max = val;
-                    }
-                }
-            }
-        } else {
-            for v in data {
+        for (i, v) in data.iter().enumerate() {
+            if Self::is_valid_in_mask(validity, i) {
                 let val = convert(v);
-                if val < min {
-                    min = val;
-                }
-                if val > max {
-                    max = val;
+                if !val.is_nan() {
+                    if val < min { min = val; }
+                    if val > max { max = val; }
                 }
             }
         }
+        
         (min, max)
     }
 
