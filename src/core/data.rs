@@ -1060,36 +1060,39 @@ impl ColumnVector {
     #[cfg(feature = "arrow")]
     pub fn from_arrow(array: &dyn Array) -> Result<Self, ChartonError> {
         match array.data_type() {
+            // --- Floating Point Types ---
             DataType::Float64 => {
                 let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                // Map nulls to NaN directly for floating point performance.
-                let data: Vec<f64> = (0..arr.len())
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            f64::NAN
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
                         } else {
-                            arr.value(i)
+                            None
                         }
-                    })
-                    .collect();
-                Ok(ColumnVector::F64 { data })
+                    }),
+                    0.0f64,
+                );
+                Ok(ColumnVector::Float64 { data, validity })
             }
             DataType::Float32 => {
                 let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-                let data: Vec<f32> = (0..arr.len())
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            f32::NAN
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
                         } else {
-                            arr.value(i)
+                            None
                         }
-                    })
-                    .collect();
-                Ok(ColumnVector::F32 { data })
+                    }),
+                    0.0f32,
+                );
+                Ok(ColumnVector::Float32 { data, validity })
             }
+
+            // --- Integer Types ---
             DataType::Int64 => {
                 let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                // Reuse collect_with_validity by creating an iterator of Option<i64>
                 let (data, validity) = collect_with_validity(
                     (0..arr.len()).map(|i| {
                         if arr.is_valid(i) {
@@ -1100,8 +1103,96 @@ impl ColumnVector {
                     }),
                     0i64,
                 );
-                Ok(ColumnVector::I64 { data, validity })
+                Ok(ColumnVector::Int64 { data, validity })
             }
+            DataType::Int32 => {
+                let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
+                        } else {
+                            None
+                        }
+                    }),
+                    0i32,
+                );
+                Ok(ColumnVector::Int32 { data, validity })
+            }
+            DataType::Int16 => {
+                let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
+                        } else {
+                            None
+                        }
+                    }),
+                    0i16,
+                );
+                Ok(ColumnVector::Int16 { data, validity })
+            }
+            DataType::Int8 => {
+                let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
+                        } else {
+                            None
+                        }
+                    }),
+                    0i8,
+                );
+                Ok(ColumnVector::Int8 { data, validity })
+            }
+            DataType::UInt64 => {
+                let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
+                        } else {
+                            None
+                        }
+                    }),
+                    0u64,
+                );
+                Ok(ColumnVector::UInt64 { data, validity })
+            }
+            DataType::UInt32 => {
+                let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
+                        } else {
+                            None
+                        }
+                    }),
+                    0u32,
+                );
+                Ok(ColumnVector::UInt32 { data, validity })
+            }
+
+            // --- Boolean Type ---
+            DataType::Boolean => {
+                let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
+                        } else {
+                            None
+                        }
+                    }),
+                    false,
+                );
+                Ok(ColumnVector::Boolean { data, validity })
+            }
+
+            // --- String Types ---
             DataType::Utf8 | DataType::LargeUtf8 => {
                 let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
                 let (data, validity) = collect_with_validity(
@@ -1116,94 +1207,132 @@ impl ColumnVector {
                 );
                 Ok(ColumnVector::String { data, validity })
             }
+
+            // --- Temporal Types ---
+            DataType::Date32 => {
+                let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+                let (data, validity) = collect_with_validity(
+                    (0..arr.len()).map(|i| {
+                        if arr.is_valid(i) {
+                            Some(arr.value(i))
+                        } else {
+                            None
+                        }
+                    }),
+                    0i32,
+                );
+                Ok(ColumnVector::Date { data, validity })
+            }
             DataType::Timestamp(unit, _) => {
+                // Convert Arrow Timestamp to i64 data and validity
+                // Note: We store raw i64 ticks in Datetime variant, keeping the unit
                 let (data, validity) = match unit {
                     TimeUnit::Second => {
-                        let arr = array
-                            .as_any()
-                            .downcast_ref::<arrow::array::TimestampSecondArray>()
-                            .unwrap();
+                        let arr = array.as_any().downcast_ref::<arrow::array::TimestampSecondArray>().unwrap();
                         collect_with_validity(
-                            (0..arr.len()).map(|i| {
-                                if arr.is_valid(i) {
-                                    Some(
-                                        OffsetDateTime::from_unix_timestamp(arr.value(i))
-                                            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-                                    )
-                                } else {
-                                    None
-                                }
-                            }),
-                            OffsetDateTime::UNIX_EPOCH,
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
                         )
                     }
                     TimeUnit::Millisecond => {
-                        let arr = array
-                            .as_any()
-                            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-                            .unwrap();
+                        let arr = array.as_any().downcast_ref::<arrow::array::TimestampMillisecondArray>().unwrap();
                         collect_with_validity(
-                            (0..arr.len()).map(|i| {
-                                if arr.is_valid(i) {
-                                    Some(
-                                        OffsetDateTime::from_unix_timestamp_nanos(
-                                            arr.value(i) as i128 * 1_000_000,
-                                        )
-                                        .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-                                    )
-                                } else {
-                                    None
-                                }
-                            }),
-                            OffsetDateTime::UNIX_EPOCH,
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
                         )
                     }
                     TimeUnit::Microsecond => {
-                        let arr = array
-                            .as_any()
-                            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-                            .unwrap();
+                        let arr = array.as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().unwrap();
                         collect_with_validity(
-                            (0..arr.len()).map(|i| {
-                                if arr.is_valid(i) {
-                                    Some(
-                                        OffsetDateTime::from_unix_timestamp_nanos(
-                                            arr.value(i) as i128 * 1_000,
-                                        )
-                                        .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-                                    )
-                                } else {
-                                    None
-                                }
-                            }),
-                            OffsetDateTime::UNIX_EPOCH,
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
                         )
                     }
                     TimeUnit::Nanosecond => {
-                        let arr = array
-                            .as_any()
-                            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-                            .unwrap();
+                        let arr = array.as_any().downcast_ref::<arrow::array::TimestampNanosecondArray>().unwrap();
                         collect_with_validity(
-                            (0..arr.len()).map(|i| {
-                                if arr.is_valid(i) {
-                                    Some(
-                                        OffsetDateTime::from_unix_timestamp_nanos(
-                                            arr.value(i) as i128
-                                        )
-                                        .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-                                    )
-                                } else {
-                                    None
-                                }
-                            }),
-                            OffsetDateTime::UNIX_EPOCH,
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
                         )
                     }
                 };
+                
+                // Map Arrow TimeUnit to Charton TimeUnit if necessary, or store directly
+                // Assuming Charton TimeUnit matches Arrow TimeUnit structure or has a conversion
+                let charton_unit = match unit {
+                    TimeUnit::Second => TimeUnit::Second,
+                    TimeUnit::Millisecond => TimeUnit::Millisecond,
+                    TimeUnit::Microsecond => TimeUnit::Microsecond,
+                    TimeUnit::Nanosecond => TimeUnit::Nanosecond,
+                };
 
-                Ok(ColumnVector::DateTime { data, validity })
+                Ok(ColumnVector::Datetime { data, validity, unit: charton_unit })
             }
+            DataType::Duration(unit) => {
+                 let (data, validity) = match unit {
+                    TimeUnit::Second => {
+                        let arr = array.as_any().downcast_ref::<arrow::array::DurationSecondArray>().unwrap();
+                        collect_with_validity(
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
+                        )
+                    }
+                    TimeUnit::Millisecond => {
+                        let arr = array.as_any().downcast_ref::<arrow::array::DurationMillisecondArray>().unwrap();
+                        collect_with_validity(
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
+                        )
+                    }
+                    TimeUnit::Microsecond => {
+                        let arr = array.as_any().downcast_ref::<arrow::array::DurationMicrosecondArray>().unwrap();
+                        collect_with_validity(
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
+                        )
+                    }
+                    TimeUnit::Nanosecond => {
+                        let arr = array.as_any().downcast_ref::<arrow::array::DurationNanosecondArray>().unwrap();
+                        collect_with_validity(
+                            (0..arr.len()).map(|i| if arr.is_valid(i) { Some(arr.value(i)) } else { None }),
+                            0i64,
+                        )
+                    }
+                };
+                 let charton_unit = match unit {
+                    TimeUnit::Second => TimeUnit::Second,
+                    TimeUnit::Millisecond => TimeUnit::Millisecond,
+                    TimeUnit::Microsecond => TimeUnit::Microsecond,
+                    TimeUnit::Nanosecond => TimeUnit::Nanosecond,
+                };
+                Ok(ColumnVector::Duration { data, validity, unit: charton_unit })
+            }
+            DataType::Time64(unit) | DataType::Time32(unit) => {
+                // Simplified: Treat as i64 for now, specific Time handling might require more logic
+                // For Time64(Nanosecond) or Time32(Millisecond)
+                let (data, validity) = collect_with_validity(
+                     (0..array.len()).map(|i| {
+                         if array.is_valid(i) {
+                             // Downcast appropriately based on unit if needed, 
+                             // but often Time64 is i64 and Time32 is i32. 
+                             // Here assuming i64 storage for simplicity as per Enum def
+                             Some(array.as_any().downcast_ref::<arrow::array::Time64NanosecondArray>()
+                                  .or_else(|| array.as_any().downcast_ref::<arrow::array::Time64MicrosecondArray>())
+                                  .map(|a| a.value(i) as i64)
+                                  .or_else(|| array.as_any().downcast_ref::<arrow::array::Time32MillisecondArray>()
+                                      .map(|a| a.value(i) as i64))
+                                  .or_else(|| array.as_any().downcast_ref::<arrow::array::Time32SecondArray>()
+                                      .map(|a| a.value(i) as i64))
+                                  .unwrap_or(0))
+                         } else {
+                             None
+                         }
+                     }),
+                     0i64
+                );
+                Ok(ColumnVector::Time { data, validity })
+            }
+
             _ => Err(ChartonError::Data(format!(
                 "Unsupported Arrow type: {:?}",
                 array.data_type()
@@ -1215,41 +1344,104 @@ impl ColumnVector {
     /// This follows Charton's columnar layout: slicing owned data for Eager operations.
     pub fn slice(&self, offset: usize, len: usize) -> Self {
         match self {
-            // Floating point variants use NaN for nulls, no validity mask needed.
-            ColumnVector::F64 { data } => ColumnVector::F64 {
+            // Floating point variants now also use validity bitmask.
+            ColumnVector::Float64 { data, validity } => ColumnVector::Float64 {
                 data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
             },
-            ColumnVector::F32 { data } => ColumnVector::F32 {
+            ColumnVector::Float32 { data, validity } => ColumnVector::Float32 {
                 data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
             },
 
-            // Integer, String, and DateTime variants use an optional validity bitmask.
-            ColumnVector::I64 { data, validity } => ColumnVector::I64 {
+            // Integer types
+            ColumnVector::Int64 { data, validity } => ColumnVector::Int64 {
                 data: data[offset..offset + len].to_vec(),
                 validity: validity
                     .as_ref()
                     .map(|v| self.slice_validity(v, offset, len)),
             },
-            ColumnVector::I32 { data, validity } => ColumnVector::I32 {
+            ColumnVector::Int32 { data, validity } => ColumnVector::Int32 {
                 data: data[offset..offset + len].to_vec(),
                 validity: validity
                     .as_ref()
                     .map(|v| self.slice_validity(v, offset, len)),
             },
-            ColumnVector::U32 { data, validity } => ColumnVector::U32 {
+            ColumnVector::Int16 { data, validity } => ColumnVector::Int16 {
                 data: data[offset..offset + len].to_vec(),
                 validity: validity
                     .as_ref()
                     .map(|v| self.slice_validity(v, offset, len)),
             },
+            ColumnVector::Int8 { data, validity } => ColumnVector::Int8 {
+                data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+            },
+            ColumnVector::UInt64 { data, validity } => ColumnVector::UInt64 {
+                data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+            },
+            ColumnVector::UInt32 { data, validity } => ColumnVector::UInt32 {
+                data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+            },
+
+            // String and Boolean types
             ColumnVector::String { data, validity } => ColumnVector::String {
                 data: data[offset..offset + len].to_vec(),
                 validity: validity
                     .as_ref()
                     .map(|v| self.slice_validity(v, offset, len)),
             },
-            ColumnVector::DateTime { data, validity } => ColumnVector::DateTime {
+            ColumnVector::Boolean { data, validity } => ColumnVector::Boolean {
                 data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+            },
+
+            // Temporal types
+            ColumnVector::Date { data, validity } => ColumnVector::Date {
+                data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+            },
+            ColumnVector::Datetime { data, validity, unit } => ColumnVector::Datetime {
+                data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+                unit: *unit,
+            },
+            ColumnVector::Duration { data, validity, unit } => ColumnVector::Duration {
+                data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+                unit: *unit,
+            },
+            ColumnVector::Time { data, validity } => ColumnVector::Time {
+                data: data[offset..offset + len].to_vec(),
+                validity: validity
+                    .as_ref()
+                    .map(|v| self.slice_validity(v, offset, len)),
+            },
+
+            // Categorical type
+            ColumnVector::Categorical { keys, values, validity } => ColumnVector::Categorical {
+                keys: keys[offset..offset + len].to_vec(),
+                values: values.clone(), // Dictionary remains unchanged
                 validity: validity
                     .as_ref()
                     .map(|v| self.slice_validity(v, offset, len)),
